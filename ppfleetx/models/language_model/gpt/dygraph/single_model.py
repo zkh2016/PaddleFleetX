@@ -139,6 +139,10 @@ class MultiHeadAttention(nn.Layer):
         self.out_proj = Linear(
             embed_dim, embed_dim, weight_attr, bias_attr=bias_attr)
 
+        #self.sparse = paddle.nn.BertSparseMask(num_heads)
+        self.sparse = paddle.nn.ErineSparseMask(num_heads)
+        self.sparse_mask = None
+
     def _fuse_prepare_qkv(self, query, use_cache=False, cache=None):
         mix_layer = self.qkv_proj(query)
         mix_layer = paddle.reshape_(mix_layer, [0, 0, -1, 3 * self.head_dim])
@@ -242,28 +246,50 @@ class MultiHeadAttention(nn.Layer):
         k = tensor.transpose(x=k, perm=perm)
         v = tensor.transpose(x=v, perm=perm)
 
-        # scale dot product attention
-        scale_qk_coeff = self.scale_qk_coeff * self.head_dim**0.5
-        product = paddle.matmul(
-            x=q.scale(1.0 / scale_qk_coeff), y=k, transpose_y=True)
+        if False:
+            # scale dot product attention
+            scale_qk_coeff = self.scale_qk_coeff * self.head_dim**0.5
+            product = paddle.matmul(
+                x=q.scale(1.0 / scale_qk_coeff), y=k, transpose_y=True)
 
-        if self.scale_qk_coeff != 1.0:
-            product = product.scale(self.scale_qk_coeff)
+            if self.scale_qk_coeff != 1.0:
+                product = product.scale(self.scale_qk_coeff)
 
-        if attn_mask is not None:
-            product = product + attn_mask
-            weights = F.softmax(product)
+            if attn_mask is not None:
+                product = product + attn_mask
+                weights = F.softmax(product)
+            else:
+                weights = incubate.softmax_mask_fuse_upper_triangle(product)
+
+            if self.dropout:
+                weights = F.dropout(
+                    weights,
+                    self.dropout,
+                    training=self.training,
+                    mode="upscale_in_train")
+
+            out = paddle.matmul(weights, v)
         else:
-            weights = incubate.softmax_mask_fuse_upper_triangle(product)
+            if (
+                self.sparse_mask is None
+                or self.sparse_mask.shape[0] != q.shape[0] * q.shape[1]
+                or self.sparse_mask.shape[1] != q.shape[2]
+            ):
+                mask = self.sparse.forward(q.shape[0], q.shape[2])
+                self.sparse_mask = mask.astype('float32').to_sparse_csr()
 
-        if self.dropout:
-            weights = F.dropout(
-                weights,
-                self.dropout,
-                training=self.training,
-                mode="upscale_in_train")
+            if attn_mask is not None:
+                attn_mask = attn_mask.squeeze()
+                if len(attn_mask.shape) == 1:
+                    attn_mask = attn_mask.reshape((1, attn_mask.shape[0]))
+            else :
+                attn_mask = paddle.ones((q.shape[2], q.shape[2])) 
+                attn_mask = paddle.tril(attn_mask)
+                attn_mask = (1.0 - attn_mask) * -1e4
+            out, weights  = paddle.sparse.nn.functional.attention(
+                q, k, v, self.sparse_mask, attn_mask=attn_mask
+            )
 
-        out = paddle.matmul(weights, v)
 
         # combine heads
         out = tensor.transpose(out, perm=[0, 2, 1, 3])
